@@ -233,21 +233,25 @@ export default createPlugin<
       // (slider × loudness normalization), also while crossfade holds the
       // video silent. Its value is kept as the target, and the element
       // plays at `target × gain`; crossfade only moves the gain.
-      const nativeVolume = Object.getOwnPropertyDescriptor(
-        HTMLMediaElement.prototype,
-        'volume',
-      )!;
+      // Look the prototype setter up on every write instead of caching it:
+      // plugins such as Exponential Volume patch HTMLMediaElement.prototype
+      // after this runs, and a cached setter would bypass them on the video
+      // while the transition audio still goes through them.
+      const setElementVolume = (volume: number) =>
+        Object.getOwnPropertyDescriptor(
+          HTMLMediaElement.prototype,
+          'volume',
+        )!.set!.call(video, volume);
       let targetVolume = video.volume;
       let gain = 1;
-      const applyVideoVolume = () =>
-        nativeVolume.set!.call(video, targetVolume * gain);
+      const applyVideoVolume = () => setElementVolume(targetVolume * gain);
       Object.defineProperty(video, 'volume', {
         configurable: true,
         get: () => targetVolume,
         set: (volume: number) => {
           if (!(volume >= 0 && volume <= 1)) {
             // Throws the native IndexSizeError
-            nativeVolume.set!.call(video, volume);
+            setElementVolume(volume);
           }
           targetVolume = volume;
           applyVideoVolume();
