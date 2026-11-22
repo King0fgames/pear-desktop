@@ -219,6 +219,8 @@ export default createPlugin<
       // skipped to the next song; the navigation it causes finishes the handover
       let handedOver = false;
       let handoverTimeout: ReturnType<typeof setTimeout> | undefined;
+      // A handover that got no song change back: don't retry it for this song
+      let handoverGaveUpFor: string | undefined;
       const fadingOut = new Set<HTMLAudioElement>();
 
       const getVideoIDFromURL = (url: string) =>
@@ -386,12 +388,31 @@ export default createPlugin<
           audio.volume = targetVolume * startGain;
           // Go to next video - XXX: does not support "repeat 1" mode
           api.nextVideo();
-          // No next song: give the old one back to the video
+          // No song change came back (e.g. end of the queue): give the old
+          // song back to the video with the same overlap instead of
+          // switching in one step, which clicks, and don't try again
           handoverTimeout = setTimeout(() => {
             if (!handedOver) return;
             handedOver = false;
-            audio.volume = 0;
-            videoGain.volume = startGain;
+            handoverGaveUpFor = currentVideoID;
+            const backStart = Date.now();
+            const stepBack = () => {
+              if (handedOver) return;
+              const progress = Math.min(
+                (Date.now() - backStart) / OVERLAP_MS,
+                1,
+              );
+              if (progress < 1) {
+                const angle = (progress * Math.PI) / 2;
+                videoGain.volume = startGain * Math.sin(angle);
+                audio.volume = targetVolume * startGain * Math.cos(angle);
+                setTimeout(stepBack, 10);
+                return;
+              }
+              audio.volume = 0;
+              videoGain.volume = startGain;
+            };
+            stepBack();
           }, 3000);
         };
         step();
@@ -426,6 +447,17 @@ export default createPlugin<
         }
       });
 
+      // The URL only follows the song on the /watch page. While another page
+      // is open (home, library, search...) song changes don't navigate, so
+      // follow the player itself too
+      api.addEventListener('videodatachange', (name, data) => {
+        if (name !== 'dataloaded') return;
+        const nextVideoID = data?.videoId ?? api.getVideoData()?.video_id;
+        if (nextVideoID && nextVideoID !== currentVideoID) {
+          onSongChange(nextVideoID);
+        }
+      });
+
       video.addEventListener('timeupdate', () => {
         if (handedOver) return;
         syncTransitionAudio();
@@ -433,7 +465,9 @@ export default createPlugin<
         if (gain === 0 && !videoFader && !video.paused) fadeInVideo();
 
         const before = this.config?.secondsBeforeEnd ?? 0;
-        if (!isReadyToCrossfade()) return;
+        if (!isReadyToCrossfade() || handoverGaveUpFor === currentVideoID) {
+          return;
+        }
         // Length from the same song's stream: `getDuration()` is sometimes
         // short right after a natural transition
         const length = transitionAudio!.duration;
@@ -464,7 +498,8 @@ export default createPlugin<
         if (!handedOver) fadeInVideo();
       });
 
-      const initialVideoID = getVideoIDFromURL(location.href);
+      const initialVideoID =
+        getVideoIDFromURL(location.href) ?? api.getVideoData()?.video_id;
       if (initialVideoID) onSongChange(initialVideoID);
     },
   },
