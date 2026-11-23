@@ -221,7 +221,9 @@ export default createPlugin<
       let handoverTimeout: ReturnType<typeof setTimeout> | undefined;
       // A handover that got no song change back: don't retry it for this song
       let handoverGaveUpFor: string | undefined;
-      const fadingOut = new Set<HTMLAudioElement>();
+      // Outgoing streams, each with its gain relative to the video's target
+      // volume, so volume changes during a fade-out still apply to them
+      const fadingOut = new Map<HTMLAudioElement, number>();
 
       const getVideoIDFromURL = (url: string) =>
         new URLSearchParams(url.split('?')?.at(-1)).get('v');
@@ -257,6 +259,9 @@ export default createPlugin<
           }
           targetVolume = volume;
           applyVideoVolume();
+          for (const [audio, outGain] of fadingOut) {
+            audio.volume = targetVolume * outGain;
+          }
         },
       });
       const videoGain: VolumeControl = {
@@ -290,9 +295,22 @@ export default createPlugin<
       };
 
       const fadeOut = (audio: HTMLAudioElement) => {
-        fadingOut.add(audio);
-        new VolumeFader(
+        fadingOut.set(
           audio,
+          targetVolume > 0 ? Math.min(audio.volume / targetVolume, 1) : 0,
+        );
+        const outGain: VolumeControl = {
+          get volume() {
+            return fadingOut.get(audio) ?? 0;
+          },
+          set volume(level: number) {
+            if (!fadingOut.has(audio)) return; // unloaded meanwhile
+            fadingOut.set(audio, level);
+            audio.volume = targetVolume * level;
+          },
+        };
+        new VolumeFader(
+          outGain,
           fadeOptions(this.config?.fadeOutDuration),
         ).fadeTo(0, () => unload(audio));
       };
@@ -537,8 +555,9 @@ export default createPlugin<
         };
         const step = () => {
           if (run !== handoverRun) return;
-          if (video.paused) {
-            // Paused mid-ramp: stay on this song, the video at full gain
+          if (video.paused || video.seeking) {
+            // Paused or seeking mid-ramp: stay on this song, the video at
+            // full gain
             handoverRun++;
             handedOver = false;
             ramping = false;
@@ -580,7 +599,7 @@ export default createPlugin<
         resetSync();
         if (handedOver) {
           handedOver = false;
-          fadeOut(previous!);
+          if (previous) fadeOut(previous);
         } else if (previous && isReadyToCrossfade()) {
           // Manual skip: the video has already switched, so hand over at once
           previous.playbackRate = video.playbackRate;
@@ -627,7 +646,11 @@ export default createPlugin<
         }
 
         const before = this.config?.secondsBeforeEnd ?? 0;
-        if (!isReadyToCrossfade() || handoverGaveUpFor === currentVideoID) {
+        if (
+          video.paused ||
+          !isReadyToCrossfade() ||
+          handoverGaveUpFor === currentVideoID
+        ) {
           return;
         }
         // Length from the same song's stream: `getDuration()` is sometimes
@@ -653,7 +676,7 @@ export default createPlugin<
       video.addEventListener('pause', () => {
         transitionAudio?.pause();
         // A fade-out cannot resume in place; drop it
-        for (const audio of fadingOut) unload(audio);
+        for (const audio of [...fadingOut.keys()]) unload(audio);
       });
 
       video.addEventListener('play', () => {
