@@ -308,18 +308,28 @@ export default createPlugin<
       // currentTime and duration span songs
       const songTime = () => api.getCurrentTime();
 
-      // Measured on Windows: with both copies at the same currentTime they are
-      // heard in step (the video's Web Audio latency is already accounted
-      // for in its currentTime), so the transition audio follows songTime()
-      const audioTarget = () => songTime();
-
+      // The transition audio follows songTime(): measured on Windows, with
+      // both copies at the same currentTime they are heard in step (the
+      // video's Web Audio latency is already part of its currentTime).
       // A seek leaves the audio tens of ms behind, which seeking again
-      // cannot fix, so small offsets are corrected through the playback rate
-      // Single currentTime readings jitter by about +-10 ms on each element,
-      // and correcting from them (or from a median of them) made the copy
-      // swing about +-25 ms around the song (heard as a small skip or repeat
-      // at the handover). The offset is instead the value at "now" of a line
-      // fitted through readings taken every 50 ms over the last 1.5 s.
+      // cannot fix, so small offsets are corrected through the playback rate.
+      // Single currentTime readings jitter by about ±10 ms on each element,
+      // and correcting from them made the copy swing ±25 ms around the song
+      // (heard as a small skip or repeat at the handover). The offset is
+      // instead read off a line fitted through recent readings.
+      const SAMPLE_MS = 50;
+      const MAX_SAMPLES = 30; // 1.5 s
+      const MIN_SAMPLES = 12; // 0.6 s
+      // Catch up this share of the offset per second...
+      const CATCH_UP_PER_S = 0.25;
+      const MAX_CORRECTION = 0.03;
+      // ...on top of a slowly learned base rate for any steady drift between
+      // the two streams (a few tenths of a percent measured on Windows).
+      // It is kept across songs, as the drift comes from the device.
+      const DRIFT_GAIN_PER_S = 0.04;
+      const MAX_DRIFT = 0.02;
+      const DRIFT_LEARN_BELOW = 0.05; // s of offset; above it, only catch up
+
       const offsetSamples: [number, number][] = [];
       setInterval(() => {
         const audio = transitionAudio;
@@ -336,16 +346,15 @@ export default createPlugin<
         }
         offsetSamples.push([
           performance.now() / 1000,
-          audio.currentTime - audioTarget(),
+          audio.currentTime - songTime(),
         ]);
-        if (offsetSamples.length > 30) offsetSamples.shift();
-      }, 50);
-      // Any steady drift between the two copies is carried by a slowly
-      // learned base rate, so the proportional part stays gentle
+        if (offsetSamples.length > MAX_SAMPLES) offsetSamples.shift();
+      }, SAMPLE_MS);
       let driftRate = 1;
-      const smoothedOffset = () => {
+      let lastDriftUpdate: number | undefined;
+      const fittedOffset = () => {
         const n = offsetSamples.length;
-        if (n < 12) return undefined;
+        if (n < MIN_SAMPLES) return undefined;
         let meanT = 0;
         let meanD = 0;
         for (const [t, d] of offsetSamples) {
@@ -361,6 +370,12 @@ export default createPlugin<
         const slope = variance > 0 ? covariance / variance : 0;
         return meanD + (slope * ((performance.now() / 1000) - meanT));
       };
+      const resetSync = () => {
+        offsetSamples.length = 0;
+        lastDriftUpdate = undefined;
+      };
+      const clamp = (value: number, limit: number) =>
+        Math.min(1 + limit, Math.max(1 - limit, value));
 
       const syncTransitionAudio = () => {
         const audio = transitionAudio;
@@ -372,32 +387,39 @@ export default createPlugin<
           return;
         }
         if (audio.paused) {
-          offsetSamples.length = 0;
-          audio.currentTime = audioTarget();
+          resetSync();
+          audio.currentTime = songTime();
           audio.play().catch(() => {});
           return;
         }
-        if (Math.abs(audio.currentTime - audioTarget()) > 0.5) {
-          offsetSamples.length = 0;
-          audio.currentTime = audioTarget();
-          audio.playbackRate = video.playbackRate;
+        if (Math.abs(audio.currentTime - songTime()) > 0.5) {
+          resetSync();
+          audio.currentTime = songTime();
+          audio.playbackRate = video.playbackRate * driftRate;
           return;
         }
-        const offset = smoothedOffset();
+        const offset = fittedOffset();
         if (offset === undefined) {
           audio.playbackRate = video.playbackRate * driftRate;
-        } else {
-          driftRate = Math.min(
-            1.02,
-            Math.max(0.98, driftRate - (offset * 0.01)),
-          );
-          // Catch up a quarter of the offset per second, at most 3% off
-          const correction = Math.min(
-            1.03,
-            Math.max(0.97, driftRate - (offset / 4)),
-          );
-          audio.playbackRate = video.playbackRate * correction;
+          return;
         }
+        const now = performance.now() / 1000;
+        if (
+          lastDriftUpdate !== undefined &&
+          Math.abs(offset) < DRIFT_LEARN_BELOW
+        ) {
+          const elapsed = Math.min(now - lastDriftUpdate, 1);
+          driftRate = clamp(
+            driftRate - (offset * DRIFT_GAIN_PER_S * elapsed),
+            MAX_DRIFT,
+          );
+        }
+        lastDriftUpdate = now;
+        const correction = clamp(
+          driftRate - (offset * CATCH_UP_PER_S),
+          MAX_CORRECTION,
+        );
+        audio.playbackRate = video.playbackRate * correction;
       };
 
       const loadTransitionAudio = async (videoID: string) => {
@@ -422,21 +444,24 @@ export default createPlugin<
         syncTransitionAudio();
       };
 
-      // Both play the old song for a moment, with an equal-power curve:
-      // switching in one step left a gap, likely because the two paths have
-      // different output delays (the video goes through the app's Web Audio graph)
+      // Both play the old song for a moment, with an equal-power curve.
       // Measured on Windows: element volume changes reach the output ~130 ms
       // late and in coarse steps (tens of ms), on both paths alike. A short
       // ramp then turns into a gap when the video's 0 lands a step before the
       // audio's full level, so ramp over longer and let the incoming side lead.
       const OVERLAP_MS = 400;
       const LEAD_MS = 100;
+      const HANDOVER_MS = OVERLAP_MS + LEAD_MS;
+      // No song change after the skip (e.g. end of the queue): give up
+      const HANDOVER_TIMEOUT_MS = 3000;
 
       // Element volumes can go through a curve on the way out (Exponential
       // Volume cubes them), and an equal-power curve on the levels then dips
       // by several dB mid-overlap. Aim for equal power at the output instead:
       // a never-played probe element tells which output a level gives, read
-      // with the getter from before any plugin patched it.
+      // with the getter as it is now. That is the native one, as long as
+      // volume-patching plugins start after this one (plugins start in
+      // alphabetical order, and Exponential Volume does).
       const outputVolume = Object.getOwnPropertyDescriptor(
         HTMLMediaElement.prototype,
         'volume',
@@ -447,9 +472,10 @@ export default createPlugin<
         return outputVolume.get!.call(probe) as number;
       };
       const levelFor = (output: number) => {
+        if (output <= 0) return 0;
         let low = 0;
         let high = 1;
-        for (let i = 0; i < 24; i++) {
+        for (let i = 0; i < 16; i++) {
           const middle = (low + high) / 2;
           if (outputFor(middle) < output) low = middle;
           else high = middle;
@@ -471,15 +497,55 @@ export default createPlugin<
       };
       const rampProgress = (elapsedMs: number) =>
         Math.min(Math.max(elapsedMs / OVERLAP_MS, 0), 1);
+      // Each handover ramp belongs to one run; a song change, pause or new
+      // handover starts another run, and stale ramps stop at their next step
+      let handoverRun = 0;
+      // A ramp (forward or back) is moving the gains, so the timeupdate
+      // fallback must not start a fade-in of its own
+      let ramping = false;
       const handOver = () => {
         const audio = transitionAudio!;
+        const run = ++handoverRun;
         handedOver = true;
+        ramping = true;
+        resetSync();
         videoFader?.stop();
         videoFader = undefined;
         audio.playbackRate = video.playbackRate;
         const startGain = gain;
         const start = Date.now();
+        const giveBack = () => {
+          if (run !== handoverRun || !handedOver) return;
+          handedOver = false;
+          handoverGaveUpFor = currentVideoID;
+          ramping = true;
+          const backStart = Date.now();
+          const stepBack = () => {
+            if (run !== handoverRun) return;
+            const elapsed = Date.now() - backStart;
+            const audioShare = 1 - rampProgress(elapsed - LEAD_MS);
+            if (audioShare > 0) {
+              setOverlap(audio, startGain, rampProgress(elapsed), audioShare);
+              setTimeout(stepBack, 10);
+              return;
+            }
+            ramping = false;
+            audio.volume = 0;
+            videoGain.volume = startGain;
+          };
+          stepBack();
+        };
         const step = () => {
+          if (run !== handoverRun) return;
+          if (video.paused) {
+            // Paused mid-ramp: stay on this song, the video at full gain
+            handoverRun++;
+            handedOver = false;
+            ramping = false;
+            audio.volume = 0;
+            videoGain.volume = startGain;
+            return;
+          }
           const elapsed = Date.now() - start;
           const videoShare = 1 - rampProgress(elapsed - LEAD_MS);
           if (videoShare > 0) {
@@ -487,8 +553,9 @@ export default createPlugin<
             setTimeout(step, 10);
             return;
           }
-          // Exact end values: cos(π/2) isn't 0, and the timeupdate fallback
-          // only fades the next song in from a gain of exactly 0
+          ramping = false;
+          // Exact end values: the timeupdate fallback only fades the next
+          // song in from a gain of exactly 0
           videoGain.volume = 0;
           audio.volume = targetVolume * startGain;
           // Go to next video - XXX: does not support "repeat 1" mode
@@ -496,33 +563,22 @@ export default createPlugin<
           // No song change came back (e.g. end of the queue): give the old
           // song back to the video with the same overlap instead of
           // switching in one step, which clicks, and don't try again
-          handoverTimeout = setTimeout(() => {
-            if (!handedOver) return;
-            handedOver = false;
-            handoverGaveUpFor = currentVideoID;
-            const backStart = Date.now();
-            const stepBack = () => {
-              if (handedOver) return;
-              const elapsed = Date.now() - backStart;
-              const audioShare = 1 - rampProgress(elapsed - LEAD_MS);
-              if (audioShare > 0) {
-                setOverlap(audio, startGain, rampProgress(elapsed), audioShare);
-                setTimeout(stepBack, 10);
-                return;
-              }
-              audio.volume = 0;
-              videoGain.volume = startGain;
-            };
-            stepBack();
-          }, 3000);
+          handoverTimeout = setTimeout(giveBack, HANDOVER_TIMEOUT_MS);
         };
         step();
       };
 
       const onSongChange = (videoID: string) => {
         const previous = transitionAudio;
+        // Stops any ramp still running for the previous song; the video's
+        // gain is then somewhere mid-ramp, so fade the new song in from 0
+        const interruptedRamp = ramping;
+        handoverRun++;
+        ramping = false;
+        clearTimeout(handoverTimeout);
+        handoverGaveUpFor = undefined;
+        resetSync();
         if (handedOver) {
-          clearTimeout(handoverTimeout);
           handedOver = false;
           fadeOut(previous!);
         } else if (previous && isReadyToCrossfade()) {
@@ -536,6 +592,7 @@ export default createPlugin<
         } else {
           unload(previous);
         }
+        if (interruptedRamp && !video.paused) fadeInVideo();
         transitionAudio = undefined;
         currentVideoID = videoID;
         loadTransitionAudio(videoID).catch(() => {});
@@ -553,7 +610,9 @@ export default createPlugin<
       // follow the player itself too
       api.addEventListener('videodatachange', (name, data) => {
         if (name !== 'dataloaded') return;
-        const nextVideoID = data?.videoId ?? api.getVideoData()?.video_id;
+        // Ask the player rather than trusting the event: after quick skips a
+        // late event can name a song that is no longer current
+        const nextVideoID = api.getVideoData()?.video_id ?? data?.videoId;
         if (nextVideoID && nextVideoID !== currentVideoID) {
           onSongChange(nextVideoID);
         }
@@ -563,7 +622,9 @@ export default createPlugin<
         if (handedOver) return;
         syncTransitionAudio();
         // The new song started without a `play` event: don't stay silent
-        if (gain === 0 && !videoFader && !video.paused) fadeInVideo();
+        if (gain === 0 && !videoFader && !ramping && !video.paused) {
+          fadeInVideo();
+        }
 
         const before = this.config?.secondsBeforeEnd ?? 0;
         if (!isReadyToCrossfade() || handoverGaveUpFor === currentVideoID) {
@@ -576,7 +637,7 @@ export default createPlugin<
         if (
           length > before * 2 &&
           time >= length - before &&
-          time < length - 0.5
+          time < length - (HANDOVER_MS / 1000) - 0.5
         ) {
           handOver();
         }
@@ -584,8 +645,8 @@ export default createPlugin<
 
       video.addEventListener('seeked', () => {
         if (transitionAudio && !handedOver) {
-          offsetSamples.length = 0;
-          transitionAudio.currentTime = audioTarget();
+          resetSync();
+          transitionAudio.currentTime = songTime();
         }
       });
 
