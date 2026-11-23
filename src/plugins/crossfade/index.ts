@@ -308,8 +308,60 @@ export default createPlugin<
       // currentTime and duration span songs
       const songTime = () => api.getCurrentTime();
 
+      // Measured on Windows: with both copies at the same currentTime they are
+      // heard in step (the video's Web Audio latency is already accounted
+      // for in its currentTime), so the transition audio follows songTime()
+      const audioTarget = () => songTime();
+
       // A seek leaves the audio tens of ms behind, which seeking again
       // cannot fix, so small offsets are corrected through the playback rate
+      // Single currentTime readings jitter by about +-10 ms on each element,
+      // and correcting from them (or from a median of them) made the copy
+      // swing about +-25 ms around the song (heard as a small skip or repeat
+      // at the handover). The offset is instead the value at "now" of a line
+      // fitted through readings taken every 50 ms over the last 1.5 s.
+      const offsetSamples: [number, number][] = [];
+      setInterval(() => {
+        const audio = transitionAudio;
+        if (
+          !audio ||
+          handedOver ||
+          transitionVideoID !== currentVideoID ||
+          video.paused ||
+          video.seeking ||
+          audio.paused ||
+          audio.seeking
+        ) {
+          return;
+        }
+        offsetSamples.push([
+          performance.now() / 1000,
+          audio.currentTime - audioTarget(),
+        ]);
+        if (offsetSamples.length > 30) offsetSamples.shift();
+      }, 50);
+      // Any steady drift between the two copies is carried by a slowly
+      // learned base rate, so the proportional part stays gentle
+      let driftRate = 1;
+      const smoothedOffset = () => {
+        const n = offsetSamples.length;
+        if (n < 12) return undefined;
+        let meanT = 0;
+        let meanD = 0;
+        for (const [t, d] of offsetSamples) {
+          meanT += t / n;
+          meanD += d / n;
+        }
+        let covariance = 0;
+        let variance = 0;
+        for (const [t, d] of offsetSamples) {
+          covariance += (t - meanT) * (d - meanD);
+          variance += (t - meanT) ** 2;
+        }
+        const slope = variance > 0 ? covariance / variance : 0;
+        return meanD + (slope * ((performance.now() / 1000) - meanT));
+      };
+
       const syncTransitionAudio = () => {
         const audio = transitionAudio;
         if (!audio || handedOver || transitionVideoID !== currentVideoID) {
@@ -320,21 +372,30 @@ export default createPlugin<
           return;
         }
         if (audio.paused) {
-          audio.currentTime = songTime();
+          offsetSamples.length = 0;
+          audio.currentTime = audioTarget();
           audio.play().catch(() => {});
           return;
         }
-        const offset = audio.currentTime - songTime();
-        if (Math.abs(offset) > 0.5) {
-          audio.currentTime = songTime();
+        if (Math.abs(audio.currentTime - audioTarget()) > 0.5) {
+          offsetSamples.length = 0;
+          audio.currentTime = audioTarget();
           audio.playbackRate = video.playbackRate;
+          return;
+        }
+        const offset = smoothedOffset();
+        if (offset === undefined) {
+          audio.playbackRate = video.playbackRate * driftRate;
         } else {
-          // Catch up half the offset per second, at most 5% faster or slower
-          const catchUp = offset / 2;
-          const correction =
-            Math.abs(offset) < 0.005
-              ? 1
-              : Math.min(1.05, Math.max(0.95, 1 - catchUp));
+          driftRate = Math.min(
+            1.02,
+            Math.max(0.98, driftRate - (offset * 0.01)),
+          );
+          // Catch up a quarter of the offset per second, at most 3% off
+          const correction = Math.min(
+            1.03,
+            Math.max(0.97, driftRate - (offset / 4)),
+          );
           audio.playbackRate = video.playbackRate * correction;
         }
       };
@@ -364,7 +425,52 @@ export default createPlugin<
       // Both play the old song for a moment, with an equal-power curve:
       // switching in one step left a gap, likely because the two paths have
       // different output delays (the video goes through the app's Web Audio graph)
-      const OVERLAP_MS = 100;
+      // Measured on Windows: element volume changes reach the output ~130 ms
+      // late and in coarse steps (tens of ms), on both paths alike. A short
+      // ramp then turns into a gap when the video's 0 lands a step before the
+      // audio's full level, so ramp over longer and let the incoming side lead.
+      const OVERLAP_MS = 400;
+      const LEAD_MS = 100;
+
+      // Element volumes can go through a curve on the way out (Exponential
+      // Volume cubes them), and an equal-power curve on the levels then dips
+      // by several dB mid-overlap. Aim for equal power at the output instead:
+      // a never-played probe element tells which output a level gives, read
+      // with the getter from before any plugin patched it.
+      const outputVolume = Object.getOwnPropertyDescriptor(
+        HTMLMediaElement.prototype,
+        'volume',
+      )!;
+      const probe = document.createElement('audio');
+      const outputFor = (level: number) => {
+        probe.volume = level;
+        return outputVolume.get!.call(probe) as number;
+      };
+      const levelFor = (output: number) => {
+        let low = 0;
+        let high = 1;
+        for (let i = 0; i < 24; i++) {
+          const middle = (low + high) / 2;
+          if (outputFor(middle) < output) low = middle;
+          else high = middle;
+        }
+        return high;
+      };
+      // Shares: 0 = silent, 1 = full.
+      const setOverlap = (
+        audio: HTMLAudioElement,
+        startGain: number,
+        videoShare: number,
+        audioShare: number,
+      ) => {
+        const full = outputFor(targetVolume * startGain);
+        const videoLevel = levelFor(full * Math.sin((videoShare * Math.PI) / 2));
+        videoGain.volume =
+          targetVolume > 0 ? Math.min(videoLevel / targetVolume, 1) : 0;
+        audio.volume = levelFor(full * Math.sin((audioShare * Math.PI) / 2));
+      };
+      const rampProgress = (elapsedMs: number) =>
+        Math.min(Math.max(elapsedMs / OVERLAP_MS, 0), 1);
       const handOver = () => {
         const audio = transitionAudio!;
         handedOver = true;
@@ -374,11 +480,10 @@ export default createPlugin<
         const startGain = gain;
         const start = Date.now();
         const step = () => {
-          const progress = Math.min((Date.now() - start) / OVERLAP_MS, 1);
-          if (progress < 1) {
-            const angle = (progress * Math.PI) / 2;
-            videoGain.volume = startGain * Math.cos(angle);
-            audio.volume = targetVolume * startGain * Math.sin(angle);
+          const elapsed = Date.now() - start;
+          const videoShare = 1 - rampProgress(elapsed - LEAD_MS);
+          if (videoShare > 0) {
+            setOverlap(audio, startGain, videoShare, rampProgress(elapsed));
             setTimeout(step, 10);
             return;
           }
@@ -398,14 +503,10 @@ export default createPlugin<
             const backStart = Date.now();
             const stepBack = () => {
               if (handedOver) return;
-              const progress = Math.min(
-                (Date.now() - backStart) / OVERLAP_MS,
-                1,
-              );
-              if (progress < 1) {
-                const angle = (progress * Math.PI) / 2;
-                videoGain.volume = startGain * Math.sin(angle);
-                audio.volume = targetVolume * startGain * Math.cos(angle);
+              const elapsed = Date.now() - backStart;
+              const audioShare = 1 - rampProgress(elapsed - LEAD_MS);
+              if (audioShare > 0) {
+                setOverlap(audio, startGain, rampProgress(elapsed), audioShare);
                 setTimeout(stepBack, 10);
                 return;
               }
@@ -483,7 +584,8 @@ export default createPlugin<
 
       video.addEventListener('seeked', () => {
         if (transitionAudio && !handedOver) {
-          transitionAudio.currentTime = songTime();
+          offsetSamples.length = 0;
+          transitionAudio.currentTime = audioTarget();
         }
       });
 
