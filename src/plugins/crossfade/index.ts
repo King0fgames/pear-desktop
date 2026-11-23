@@ -532,6 +532,21 @@ export default createPlugin<
           targetVolume > 0 ? Math.min(videoLevel / targetVolume, 1) : 0;
         audio.volume = levelFor(full * Math.sin((audioShare * Math.PI) / 2));
       };
+      // Measured: the page can stall for ~0.5 s right as the handover begins,
+      // and a wall-clock ramp then jumps from start to end in one step (heard
+      // as a hitch). Advance the ramp by at most this much per step instead,
+      // so a stall only delays it.
+      const MAX_RAMP_STEP_MS = 30;
+      const rampClock = () => {
+        let last = performance.now();
+        let elapsed = 0;
+        return () => {
+          const now = performance.now();
+          elapsed += Math.min(now - last, MAX_RAMP_STEP_MS);
+          last = now;
+          return elapsed;
+        };
+      };
       const rampProgress = (elapsedMs: number) =>
         Math.min(Math.max(elapsedMs / OVERLAP_MS, 0), 1);
       // Each handover ramp belongs to one run; a song change, pause or new
@@ -550,16 +565,16 @@ export default createPlugin<
         videoFader = undefined;
         audio.playbackRate = video.playbackRate;
         const startGain = gain;
-        const start = Date.now();
+        const forwardClock = rampClock();
         const giveBack = () => {
           if (run !== handoverRun || !handedOver) return;
           handedOver = false;
           handoverGaveUpFor = currentVideoID;
           ramping = true;
-          const backStart = Date.now();
+          const backClock = rampClock();
           const stepBack = () => {
             if (run !== handoverRun) return;
-            const elapsed = Date.now() - backStart;
+            const elapsed = backClock();
             const audioShare = 1 - rampProgress(elapsed - LEAD_MS);
             if (audioShare > 0) {
               setOverlap(audio, startGain, rampProgress(elapsed), audioShare);
@@ -584,7 +599,7 @@ export default createPlugin<
             videoGain.volume = startGain;
             return;
           }
-          const elapsed = Date.now() - start;
+          const elapsed = forwardClock();
           const videoShare = 1 - rampProgress(elapsed - LEAD_MS);
           if (videoShare > 0) {
             setOverlap(audio, startGain, videoShare, rampProgress(elapsed));
