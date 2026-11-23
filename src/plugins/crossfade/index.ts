@@ -13,6 +13,7 @@ import { createPlugin, LoggerPrefix } from '@/utils';
 import { type VolumeControl, VolumeFader } from './fader';
 
 import type { RendererContext } from '@/types/contexts';
+import type { QueueElement } from '@/types/queue';
 import type { BrowserWindow } from 'electron';
 
 export type CrossfadePluginConfig = {
@@ -315,6 +316,24 @@ export default createPlugin<
         ).fadeTo(0, () => unload(audio));
       };
 
+      // Only crossfade into a song that will follow: at the end of the queue
+      // with autoplay off (or on repeat one) skipping has nothing to go to,
+      // and the handover would cut the last song off early. With autoplay
+      // on, skipping past the last song starts a new radio queue. Without
+      // the queue store, assume there is a next song, as before.
+      const hasNextSong = () => {
+        const queue = document.querySelector<QueueElement>('#queue')?.queue
+          ?.store?.store?.getState()?.queue;
+        if (!queue) return true;
+        if (queue.repeatMode === 'ONE') return false;
+        return (
+          queue.autoplay ||
+          queue.repeatMode === 'ALL' ||
+          queue.selectedItemIndex < queue.items.length - 1 ||
+          queue.automixItems.length > 0
+        );
+      };
+
       const isReadyToCrossfade = () =>
         !!transitionAudio &&
         transitionVideoID === currentVideoID &&
@@ -577,7 +596,7 @@ export default createPlugin<
           // song in from a gain of exactly 0
           videoGain.volume = 0;
           audio.volume = targetVolume * startGain;
-          // Go to next video - XXX: does not support "repeat 1" mode
+          // Go to next video (never on repeat one, see hasNextSong)
           api.nextVideo();
           // No song change came back (e.g. end of the queue): give the old
           // song back to the video with the same overlap instead of
@@ -660,7 +679,8 @@ export default createPlugin<
         if (
           length > before * 2 &&
           time >= length - before &&
-          time < length - (HANDOVER_MS / 1000) - 0.5
+          time < length - (HANDOVER_MS / 1000) - 0.5 &&
+          hasNextSong()
         ) {
           handOver();
         }
