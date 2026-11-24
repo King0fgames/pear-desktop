@@ -287,9 +287,37 @@ export default createPlugin<
         });
       };
 
+      // The video plays through the app's Web Audio graph (src/renderer.ts),
+      // which adds that context's output latency: measured on Windows, a
+      // plain <audio> at the same currentTime was heard ~70-90 ms earlier,
+      // a brief repeat at every handover. Route the transition audio through
+      // the same context, so both reach the output with the same delay.
+      // Element volume still applies before the source node.
+      let sharedContext: AudioContext | undefined;
+      const routedAudio = new WeakMap<
+        HTMLAudioElement,
+        MediaElementAudioSourceNode
+      >();
+      const routeThroughSharedContext = (audio: HTMLAudioElement) => {
+        if (!sharedContext || routedAudio.has(audio)) return;
+        try {
+          const source = sharedContext.createMediaElementSource(audio);
+          source.connect(sharedContext.destination);
+          routedAudio.set(audio, source);
+        } catch (error) {
+          console.warn(LoggerPrefix, 'Crossfade could not route audio', error);
+        }
+      };
+      document.addEventListener('peard:audio-can-play', (event) => {
+        sharedContext = event.detail.audioContext;
+        if (transitionAudio) routeThroughSharedContext(transitionAudio);
+      });
+
       const unload = (audio: HTMLAudioElement | undefined) => {
         if (!audio) return;
         fadingOut.delete(audio);
+        routedAudio.get(audio)?.disconnect();
+        routedAudio.delete(audio);
         audio.pause();
         audio.removeAttribute('src');
         audio.load();
@@ -345,9 +373,9 @@ export default createPlugin<
       // currentTime and duration span songs
       const songTime = () => api.getCurrentTime();
 
-      // The transition audio follows songTime(): measured on Windows, with
-      // both copies at the same currentTime they are heard in step (the
-      // video's Web Audio latency is already part of its currentTime).
+      // The transition audio follows songTime(): both go through the same
+      // Web Audio context (see routeThroughSharedContext), so at the same
+      // currentTime they are heard in step.
       // A seek leaves the audio tens of ms behind, which seeking again
       // cannot fix, so small offsets are corrected through the playback rate.
       // Single currentTime readings jitter by about ±10 ms on each element,
@@ -467,6 +495,8 @@ export default createPlugin<
         if (!url) return; // the next song change is a plain cut
 
         const audio = new Audio();
+        // Needed to route it through Web Audio (googlevideo sends CORS headers)
+        audio.crossOrigin = 'anonymous';
         audio.preload = 'auto';
         audio.volume = 0;
         audio.addEventListener('error', () => {
@@ -476,6 +506,7 @@ export default createPlugin<
           }
         });
         audio.src = url;
+        routeThroughSharedContext(audio);
         transitionAudio = audio;
         transitionVideoID = videoID;
         syncTransitionAudio();
