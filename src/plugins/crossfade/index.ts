@@ -11,6 +11,7 @@ import promptOptions from '@/providers/prompt-options';
 import { createPlugin, LoggerPrefix } from '@/utils';
 
 import { type VolumeControl, VolumeFader } from './fader';
+import { clearTimer, setRepeatingTimer, setTimer } from './timers';
 
 import type { RendererContext } from '@/types/contexts';
 import type { QueueElement } from '@/types/queue';
@@ -219,7 +220,7 @@ export default createPlugin<
       // The end trigger moved the old song to the transition audio and
       // skipped to the next song; the navigation it causes finishes the handover
       let handedOver = false;
-      let handoverTimeout: ReturnType<typeof setTimeout> | undefined;
+      let handoverTimeout: number | undefined;
       // A handover that got no song change back: don't retry it for this song
       let handoverGaveUpFor: string | undefined;
       // Outgoing streams, each with its gain relative to the video's target
@@ -396,7 +397,7 @@ export default createPlugin<
       const DRIFT_LEARN_BELOW = 0.05; // s of offset; above it, only catch up
 
       const offsetSamples: [number, number][] = [];
-      setInterval(() => {
+      setRepeatingTimer(() => {
         const audio = transitionAudio;
         if (
           !audio ||
@@ -487,6 +488,14 @@ export default createPlugin<
         audio.playbackRate = video.playbackRate * correction;
       };
 
+      // Measured: at volume 0, Chromium plays an element on a stand-in clock
+      // instead of the audio output, and switching to the output when the
+      // volume rises moves its currentTime by ~40-60 ms. The copy came in
+      // that far ahead at every handover, heard as a brief repeat. Keep the
+      // copy just above 0 (-80 dB, or far less through Exponential Volume),
+      // so it stays on the output and the sync loop measures what is heard.
+      const SILENT_VOLUME = 0.0001;
+
       const loadTransitionAudio = async (videoID: string) => {
         const url = (await this.ipc?.invoke('audio-url', videoID)) as string;
         if (videoID !== currentVideoID) return; // skipped in the meantime
@@ -498,7 +507,7 @@ export default createPlugin<
         // Needed to route it through Web Audio (googlevideo sends CORS headers)
         audio.crossOrigin = 'anonymous';
         audio.preload = 'auto';
-        audio.volume = 0;
+        audio.volume = SILENT_VOLUME;
         audio.addEventListener('error', () => {
           if (transitionAudio === audio) {
             transitionAudio = undefined;
@@ -561,7 +570,10 @@ export default createPlugin<
         const videoLevel = levelFor(full * Math.sin((videoShare * Math.PI) / 2));
         videoGain.volume =
           targetVolume > 0 ? Math.min(videoLevel / targetVolume, 1) : 0;
-        audio.volume = levelFor(full * Math.sin((audioShare * Math.PI) / 2));
+        audio.volume = Math.max(
+          levelFor(full * Math.sin((audioShare * Math.PI) / 2)),
+          SILENT_VOLUME,
+        );
       };
       // Measured: the page can stall for ~0.5 s right as the handover begins,
       // and a wall-clock ramp then jumps from start to end in one step (heard
@@ -578,6 +590,15 @@ export default createPlugin<
           return elapsed;
         };
       };
+      // Any offset left when the ramp starts is heard through the whole
+      // overlap. The copy is still silent then, so first pull it in line with
+      // a faster rate than the sync loop uses, and ramp once it holds.
+      const ALIGN_TOLERANCE = 0.02; // s; currentTime reads jitter by ~10 ms
+      const ALIGN_TIME_S = 0.25; // close the gap over about this long
+      const MAX_ALIGN_CORRECTION = 0.15;
+      const MAX_ALIGN_MS = 1500;
+      const ALIGN_STEP_MS = 20;
+      const ALIGN_HOLD_STEPS = 3;
       const rampProgress = (elapsedMs: number) =>
         Math.min(Math.max(elapsedMs / OVERLAP_MS, 0), 1);
       // Each handover ramp belongs to one run; a song change, pause or new
@@ -596,7 +617,7 @@ export default createPlugin<
         videoFader = undefined;
         audio.playbackRate = video.playbackRate;
         const startGain = gain;
-        const forwardClock = rampClock();
+        let forwardClock = rampClock();
         const giveBack = () => {
           if (run !== handoverRun || !handedOver) return;
           handedOver = false;
@@ -609,11 +630,11 @@ export default createPlugin<
             const audioShare = 1 - rampProgress(elapsed - LEAD_MS);
             if (audioShare > 0) {
               setOverlap(audio, startGain, rampProgress(elapsed), audioShare);
-              setTimeout(stepBack, 10);
+              setTimer(stepBack, 10);
               return;
             }
             ramping = false;
-            audio.volume = 0;
+            audio.volume = SILENT_VOLUME;
             videoGain.volume = startGain;
           };
           stepBack();
@@ -626,7 +647,7 @@ export default createPlugin<
             handoverRun++;
             handedOver = false;
             ramping = false;
-            audio.volume = 0;
+            audio.volume = SILENT_VOLUME;
             videoGain.volume = startGain;
             return;
           }
@@ -634,7 +655,7 @@ export default createPlugin<
           const videoShare = 1 - rampProgress(elapsed - LEAD_MS);
           if (videoShare > 0) {
             setOverlap(audio, startGain, videoShare, rampProgress(elapsed));
-            setTimeout(step, 10);
+            setTimer(step, 10);
             return;
           }
           ramping = false;
@@ -647,9 +668,38 @@ export default createPlugin<
           // No song change came back (e.g. end of the queue): give the old
           // song back to the video with the same overlap instead of
           // switching in one step, which clicks, and don't try again
-          handoverTimeout = setTimeout(giveBack, HANDOVER_TIMEOUT_MS);
+          handoverTimeout = setTimer(giveBack, HANDOVER_TIMEOUT_MS);
         };
-        step();
+        // Leave enough of the song for the ramp itself
+        const alignFor = Math.min(
+          MAX_ALIGN_MS,
+          ((audio.duration - songTime()) * 1000) - HANDOVER_MS - 300,
+        );
+        const alignStart = performance.now();
+        let inLine = 0;
+        const align = () => {
+          if (run !== handoverRun) return;
+          const offset = audio.currentTime - songTime();
+          inLine = Math.abs(offset) < ALIGN_TOLERANCE ? inLine + 1 : 0;
+          if (
+            video.paused ||
+            video.seeking ||
+            inLine >= ALIGN_HOLD_STEPS ||
+            performance.now() - alignStart > alignFor
+          ) {
+            audio.playbackRate = video.playbackRate;
+            forwardClock = rampClock();
+            step();
+            return;
+          }
+          const correction = Math.min(
+            1 + MAX_ALIGN_CORRECTION,
+            Math.max(1 - MAX_ALIGN_CORRECTION, 1 - (offset / ALIGN_TIME_S)),
+          );
+          audio.playbackRate = video.playbackRate * correction;
+          setTimer(align, ALIGN_STEP_MS);
+        };
+        align();
       };
 
       const onSongChange = (videoID: string) => {
@@ -659,7 +709,7 @@ export default createPlugin<
         const interruptedRamp = ramping;
         handoverRun++;
         ramping = false;
-        clearTimeout(handoverTimeout);
+        clearTimer(handoverTimeout);
         handoverGaveUpFor = undefined;
         resetSync();
         if (handedOver) {
