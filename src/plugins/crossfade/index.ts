@@ -223,9 +223,19 @@ export default createPlugin<
       let handoverTimeout: number | undefined;
       // A handover that got no song change back: don't retry it for this song
       let handoverGaveUpFor: string | undefined;
-      // Outgoing streams, each with its gain relative to the video's target
-      // volume, so volume changes during a fade-out still apply to them
-      const fadingOut = new Map<HTMLAudioElement, number>();
+      // Outgoing streams. Each keeps its starting volume and follows the
+      // user's volume relative to when its fade-out began, so volume changes
+      // during a fade-out still apply to it. It does not follow the video's
+      // target: YouTube Music rewrites that for the next song (loudness
+      // normalization, sometimes briefly unnormalized first), which made the
+      // outgoing song briefly louder after its fade-out began.
+      type FadingOut = { start: number; user: number; level: number };
+      const fadingOut = new Map<HTMLAudioElement, FadingOut>();
+      const userVolume = () => (api.isMuted() ? 0 : api.getVolume() / 100);
+      const applyFadingOut = (audio: HTMLAudioElement, entry: FadingOut) => {
+        const scale = entry.user > 0 ? userVolume() / entry.user : 0;
+        audio.volume = Math.min(entry.start * entry.level * scale, 1);
+      };
 
       const getVideoIDFromURL = (url: string) =>
         new URLSearchParams(url.split('?')?.at(-1)).get('v');
@@ -261,8 +271,8 @@ export default createPlugin<
           }
           targetVolume = volume;
           applyVideoVolume();
-          for (const [audio, outGain] of fadingOut) {
-            audio.volume = targetVolume * outGain;
+          for (const [audio, entry] of fadingOut) {
+            applyFadingOut(audio, entry);
           }
         },
       });
@@ -325,18 +335,20 @@ export default createPlugin<
       };
 
       const fadeOut = (audio: HTMLAudioElement) => {
-        fadingOut.set(
-          audio,
-          targetVolume > 0 ? Math.min(audio.volume / targetVolume, 1) : 0,
-        );
+        fadingOut.set(audio, {
+          start: audio.volume,
+          user: userVolume(),
+          level: 1,
+        });
         const outGain: VolumeControl = {
           get volume() {
-            return fadingOut.get(audio) ?? 0;
+            return fadingOut.get(audio)?.level ?? 0;
           },
           set volume(level: number) {
-            if (!fadingOut.has(audio)) return; // unloaded meanwhile
-            fadingOut.set(audio, level);
-            audio.volume = targetVolume * level;
+            const entry = fadingOut.get(audio);
+            if (!entry) return; // unloaded meanwhile
+            entry.level = level;
+            applyFadingOut(audio, entry);
           },
         };
         new VolumeFader(
